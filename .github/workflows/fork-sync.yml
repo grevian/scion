@@ -12,7 +12,8 @@
 #       git fetch upstream main && git merge upstream/main   # fix, commit
 #       git push origin main
 #     then re-run this workflow.
-#   Pushing needs secrets.FORK_SYNC_TOKEN: upstream changes .github/workflows,
+#   Pushing needs secrets.FORK_SYNC_TOKEN (without it, the run fails only when
+#   there is something to push): upstream changes .github/workflows,
 #   and GitHub refuses workflow-file changes pushed with the built-in token. Use
 #   a fine-grained token for this repository only, with Contents and Workflows
 #   read/write.
@@ -59,22 +60,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Require the sync token
-        env:
-          TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error title=FORK_SYNC_TOKEN missing::Add a fine-grained token (this repository; Contents and Workflows read/write) as the FORK_SYNC_TOKEN Actions secret."
-            exit 1
-          fi
-
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
 
       - name: Merge and push
+        env:
+          HAVE_TOKEN: ${{ secrets.FORK_SYNC_TOKEN != '' }}
         run: |
           set -euo pipefail
           git remote add upstream "$UPSTREAM"
@@ -97,6 +91,10 @@ jobs:
               echo "Merge by hand (see the header of .github/workflows/fork-sync.yml), then re-run."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error title=Upstream merge conflicts::$(echo "$files" | tr '\n' ' ')"
+            exit 1
+          fi
+          if [ "$HAVE_TOKEN" != true ]; then
+            echo "::error title=FORK_SYNC_TOKEN missing::Cannot push the merge. Add a fine-grained token (this repository; Contents and Workflows read/write) as the FORK_SYNC_TOKEN Actions secret."
             exit 1
           fi
           git push origin HEAD:main
