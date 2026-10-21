@@ -325,6 +325,8 @@ jobs:
   update-manifest:
     name: Update LATEST.json
     needs: release
+    # LATEST.json is upstream's update channel; a fork's releases must not move it.
+    if: github.repository == 'GoogleCloudPlatform/scion'
     runs-on: ubuntu-latest
     permissions:
       contents: write

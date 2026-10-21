@@ -1,0 +1,173 @@
+# Fork only (never runs in GoogleCloudPlatform/scion).
+#
+# Daily: merge upstream main into this fork's main, then cut a fork nightly
+# release from main if it changed since the last one. scion-ops deploys these
+# releases (its UPSTREAM_REPO / UPSTREAM_VERSION).
+#
+# Sync
+#   - Fork main already contains upstream main: nothing to do.
+#   - Otherwise upstream main is merged in (a fast-forward while the fork has
+#     no commits of its own) and pushed.
+#   - A conflict fails the run and lists the files. Resolve it by hand:
+#       git fetch upstream main && git merge upstream/main   # fix, commit
+#       git push origin main
+#     then re-run this workflow.
+#   Pushing needs secrets.FORK_SYNC_TOKEN: upstream changes .github/workflows,
+#   and GitHub refuses workflow-file changes pushed with the built-in token. Use
+#   a fine-grained token for this repository only, with Contents and Workflows
+#   read/write.
+#
+# Release
+#   Tag nightly-YYYYMMDD-fork (nightly-YYYYMMDD-fork.N for a second release on
+#   the same day) on main and build it with build-release.yml, which publishes
+#   the binaries, chat plugins and SHA256SUMS as a GitHub release. Skipped when
+#   main has not changed since the last fork release, unless force_release.
+#   The -fork suffix keeps the names apart from upstream's nightly-YYYYMMDD;
+#   upstream tags are never fetched into this fork. The newest KEEP releases
+#   are kept; older fork nightlies are deleted with their tags.
+name: Fork Sync and Nightly
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # after upstream's 02:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: Cut a release even if main has not changed since the last one
+        type: boolean
+        default: false
+      skip_release:
+        description: Only sync, no release
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/GoogleCloudPlatform/scion.git
+  KEEP: '20'
+
+jobs:
+  sync:
+    name: Merge upstream main
+    if: github.repository != 'GoogleCloudPlatform/scion'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require the sync token
+        env:
+          TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error title=FORK_SYNC_TOKEN missing::Add a fine-grained token (this repository; Contents and Workflows read/write) as the FORK_SYNC_TOKEN Actions secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
+      - name: Merge and push
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          up="$(git rev-parse upstream/main)"
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "Fork main already contains upstream main ${up:0:12}." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          before="$(git rev-parse HEAD)"
+          if ! git merge --no-edit -m "Merge upstream main ${up:0:12}" upstream/main; then
+            files="$(git diff --name-only --diff-filter=U)"
+            git merge --abort
+            {
+              echo "### Upstream merge conflicts"
+              echo "Merging upstream main ${up:0:12} into fork main ${before:0:12} conflicts in:"
+              echo '```'; echo "$files"; echo '```'
+              echo "Merge by hand (see the header of .github/workflows/fork-sync.yml), then re-run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Upstream merge conflicts::$(echo "$files" | tr '\n' ' ')"
+            exit 1
+          fi
+          git push origin HEAD:main
+          n="$(git rev-list --count "$before..HEAD")"
+          echo "Merged upstream main ${up:0:12} into fork main: ${before:0:12} -> $(git rev-parse --short=12 HEAD) ($n new commits)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: Tag fork nightly
+    needs: sync
+    if: ${{ !inputs.skip_release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write    # push the tag
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Tag main
+        id: tag
+        env:
+          FORCE: ${{ inputs.force_release || false }}
+        run: |
+          set -euo pipefail
+          last="$(git tag -l 'nightly-*-fork*' | sort -V | tail -1)"
+          if [ -n "$last" ] && [ "$(git rev-list --count "$last..HEAD")" -eq 0 ] && [ "$FORCE" != true ]; then
+            echo "Main has not changed since $last; no release." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          base="nightly-$(date -u +%Y%m%d)-fork"
+          tag="$base"; n=1
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do n=$((n + 1)); tag="$base.$n"; done
+          git tag "$tag"
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Tagged $tag at $(git rev-parse --short=12 HEAD)${last:+ (previous: $last)}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build fork nightly
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    permissions:
+      contents: write
+      pull-requests: write   # requested by build-release.yml's update-manifest job, which skips in forks
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag }}
+
+  cleanup:
+    name: Delete old fork nightlies
+    needs: [tag, build]
+    if: needs.tag.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Keep the newest ${{ env.KEEP }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E '^nightly-[0-9]{8}-fork' | sort -V | head -n -"$KEEP" \
+            | while read -r t; do
+                echo "Deleting $t"
+                gh release delete "$t" --yes --cleanup-tag
+              done
