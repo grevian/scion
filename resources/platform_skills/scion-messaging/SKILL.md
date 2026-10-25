@@ -47,6 +47,8 @@ Choosing the right recipient is critical to avoid spam and ensure the message re
 ### Mentions
 
 - You can alert a secondary tier participant in a conversation by using the `@<agent-name>` or `@<email>` recipient types in the body of a message. Use this for FYI informative or CC, be clear if there is a response or action expected. If there is more than one primary recipient use the `group[]` recipient type.
+- **Any bare `@word` in a message body is parsed as a mention**, whether or not it names an agent. When it does not, the CLI prints a warning such as `Note: @word is not an agent in this project; no agent was notified.` The message itself is still delivered ("Message accepted"); only the mention is dropped.
+- When you quote code or text containing `@` (decorators, annotations like `@export`, emails), **wrap it in backticks** (`` `@export` ``). Text inside backticks is not parsed as a mention. Check the CLI output for "is not an agent" notes after sending.
 
 ## Message Timing and Cadence
 
